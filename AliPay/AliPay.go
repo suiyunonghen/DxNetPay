@@ -17,6 +17,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"sync"
+	"bytes"
+	"strings"
 	"hash"
 )
 
@@ -37,10 +39,14 @@ const(
 type AliPayClient struct {
 	fAppId	string
 	fPrivateKey string    //用户私钥
+	fPublickey  string    //支付宝公钥
+	privateKey *rsa.PrivateKey
+	publicKey  *rsa.PublicKey
 	SignType   SignType  //签名算法类型
 	Alipayurl string      //阿里巴巴的API网关
 	NotifyGateWayurl  string	//应用网关，回调通知
 	ClientUid	  string 	//主要用来设置支付中的系统商的PID,sys_service_provider_id
+	VerifySign	bool		//是否验证签名
 }
 
 //订单操作的返回结构
@@ -59,7 +65,6 @@ type TaoBoUserInfo struct {
 	Refresh_token   string   //刷新令牌
 	Expires_in      uint      //令牌有效时间长度
 	Re_Expires_in   uint      //刷新令牌有效时间长度
-	Sign            string   //返回的签名
 }
 
 //商品信息
@@ -72,6 +77,18 @@ type GoodInfo struct {
 	Goods_category		string	`json:"goods_category"`
 	Body			string	`json:"body"`
 	Show_url		string	`json:"show_url"`
+}
+
+//退款信息结构体
+type TradeRefundInfo struct {
+	Out_trade_no		string 	`json:"out_trade_no"`	//商户系统产生的订单编号
+	Trade_no		string 	`json:"trade_no"`	//支付宝交易号
+	Refund_amount		float32	`json:"refund_amount"`  //退款金额
+	Refund_reason		string 	`json:"refund_reason"` //退款原因
+	Out_request_no		string 	`json:"out_request_no"` //商户的退款单编号，如果一个订单要多次退款，必填
+	Operator_id		string 	`json:"operator_id"` //商户操作员ID
+	Store_id		string 	`json:"store_id"` //商户门店ID
+	Terminal_id		string 	`json:"terminal_id"` //商户终端机器ID
 }
 
 func (good *GoodInfo)JsonString()string  {
@@ -183,6 +200,7 @@ type argValue struct {
 var (
 	InvalidResponseErr = errors.New("无效的命令返回信息")
 	InvalidPrivateKeyErr = errors.New("无效的私钥")
+	InvalidPublicKeyErr = errors.New("无效的支付宝公钥")
 	ParsePrivateKeyErr = errors.New("ParsePKCS1PrivateKey失效")
 	SignPKCS1v15Err = errors.New("SignPKCS1v15执行失败")
 )
@@ -253,7 +271,107 @@ func (method *AlipayMethod)Call(client *AliPayClient)([]byte, error)  {
 	if err != nil{
 		return nil,err
 	}
+	if client.VerifySign{ //执行返回验证签名
+
+	}
 	return resp.Body(),nil
+}
+
+func getResponsestr(respbody,resps []byte)(respstr,signstr string)  {
+	idx := bytes.Index(respbody,resps)//返回Resps的位置
+	if idx<0{
+		return "",""
+	}
+	respstr,signstr ="",""
+	idx += len(resps)//实际开始的位置
+	body := respbody[idx:]
+	hasStart := false
+	startidx := 0
+	startcount := 0 //{开始元素的个数，碰到}减一个
+	for index,v := range body{
+		//先获取respstr数据
+		if v=='{'{
+			if !hasStart{
+				hasStart=true
+				startidx = index//开始了
+			}
+			startcount++
+		}else if v == '}'{
+			if startcount--;startcount==0{
+				//完结
+				respstr = string(body[startidx:index+1])
+				body = body[index+1:]
+				break
+			}
+
+		}
+	}
+	resps = []byte(`sign"`)
+	idx = bytes.Index(body,resps)//返回Resps的位置
+	if idx >=0{
+		idx += len(resps)//实际开始的位置
+		body := body[idx:]
+		hasStart = false
+		for index,v := range body{
+			if v=='"'{//字符串开始
+				if !hasStart{
+					hasStart = true
+					startidx = index+1//开始了
+				}else{//结束
+					signstr = string(body[startidx:index])
+					break
+				}
+			}
+		}
+	}
+	return respstr,signstr
+}
+
+func (method *AlipayMethod)CallEx(client *AliPayClient,responsekey string)(map[string]interface{}, error)  {
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer func(){
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+	}()
+	//执行命令提交
+	req.SetRequestURI(client.Alipayurl) //API网关
+	err := client.getSign(method.args[:method.fargIndex],req)
+	if err != nil{
+		return nil,err
+	}
+	err = method.httpclient.Do(req,resp)
+	if err != nil{
+		return nil,err
+	}
+	if responsekey == ""{
+		responsekey = fmt.Sprintf("%s_response",strings.Replace(method.Name,".","_",-1))
+	}
+	body := resp.Body()
+	//fmt.Println(string(body))
+	if client.VerifySign{ //执行返回验证签名
+		str,signstr := getResponsestr(body,[]byte(responsekey))
+		if str =="" || signstr==""{
+			return nil,errors.New("获取验证签名数据失败！")
+		}
+		//开始执行验证签名
+		if err = client.CheckSign(str,signstr,client.SignType);err!=nil{
+			return nil,err
+		}
+
+	}
+
+	ok := false
+	var v interface{}
+	result := make(map[string]interface{})
+	err = json.Unmarshal(body,&result)
+	if err != nil{
+		return nil,err
+	}
+	if v,ok = result[responsekey];!ok{
+		return nil,InvalidResponseErr
+	}
+	return v.(map[string]interface{}),nil
 }
 
 var(
@@ -295,24 +413,28 @@ func (client *AliPayClient)getSign(args []argValue,req *fasthttp.Request) error 
 		}
 	}
 	//通过RSA签名
-	block, _ := pem.Decode(([]byte)(client.fPrivateKey))
-	if block == nil{
-		return InvalidPrivateKeyErr
+	if client.privateKey == nil{
+		block, _ := pem.Decode(([]byte)(client.fPrivateKey))
+		if block == nil{
+			return InvalidPrivateKeyErr
+		}
+		privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil{
+			return  ParsePrivateKeyErr
+		}
+		client.privateKey = privateKey
 	}
-	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil{
-		return  ParsePrivateKeyErr
-	}
-	result,err = client.RsaSign(result,privateKey) //签名
+	result,err := client.RsaSign(result) //签名
 	if err != nil{
 		return err
+	}else{
+		reqargs.Add("sign",result)
 	}
-	reqargs.Add("sign",result)
 	return nil
 }
 
 //RSA签名
-func (client *AliPayClient)RsaSign(origData string, privateKey *rsa.PrivateKey) (string, error) {
+func (client *AliPayClient)RsaSign(origData string) (string, error) {
 	var (
 		h hash.Hash
 		hashtype crypto.Hash
@@ -326,7 +448,7 @@ func (client *AliPayClient)RsaSign(origData string, privateKey *rsa.PrivateKey) 
 	}
 	h.Write([]byte(origData))
 	digest := h.Sum(nil)
-	s, err := rsa.SignPKCS1v15(nil, privateKey, hashtype, digest)
+	s, err := rsa.SignPKCS1v15(nil, client.privateKey, hashtype, digest)
 	if err != nil {
 		return "", SignPKCS1v15Err
 	}
@@ -341,28 +463,51 @@ func (client *AliPayClient)getSignType()string  {
 	return "RSA2"
 }
 
+//验签函数
+//srcData验签数据,sign签名数据
+func (client *AliPayClient)CheckSign(srcData,sign string,signtype SignType)error  {
+	//sign需要Base64解码
+	if body,err := base64.StdEncoding.DecodeString(sign);err !=nil{
+		return err
+	}else{
+		if client.publicKey == nil{
+			block, _ := pem.Decode(([]byte)(client.fPublickey))
+			if block == nil{
+				return InvalidPublicKeyErr
+			}
+			publickey, err := x509.ParsePKIXPublicKey(block.Bytes)
+			if err != nil{
+				return  InvalidPublicKeyErr
+			}
+			client.publicKey = publickey.(*rsa.PublicKey)
+		}
+		var (
+			h hash.Hash
+			hashtype crypto.Hash
+		)
+		if signtype == RSA2{
+			h = sha256.New()
+			hashtype = crypto.SHA256
+		}else{
+			h = sha1.New()
+			hashtype = crypto.SHA1
+		}
+		h.Write([]byte(srcData))
+		digest := h.Sum(nil)
+		return rsa.VerifyPKCS1v15(client.publicKey,hashtype,digest,body)
+	}
+}
+
 //查询某个应用授权AppAuthToken的授权信息
 func (client *AliPayClient)Query_Auth_Toker(userinfo *TaoBoUserInfo)(ResponseStatus,error){
 	method := getMethod("alipay.open.auth.token.app.query",client.fAppId,client.getSignType())
 	defer freeMethod(method)
 	method.FillNormalargs()
 	method.appendArg("biz_content",fmt.Sprintf(`{"app_auth_token":"%s"}`,userinfo.Auth_token))
-	body,err := method.Call(client)
-	if err == InvalidResponseErr || err == InvalidPrivateKeyErr ||
-	   err == ParsePrivateKeyErr || err == SignPKCS1v15Err{
+	responsemap,err := method.CallEx(client,"alipay_open_auth_token_app_query_response")
+	if err!=nil{
 		return RS_Error,err
 	}
-	ok := false
-	var v interface{}
-	result := make(map[string]interface{})
-	err = json.Unmarshal(body,&result)
-	if err != nil{
-		return RS_Error,err
-	}
-	if v,ok = result["alipay_open_auth_token_app_query_response"];!ok{
-		return RS_Error,InvalidResponseErr
-	}
-	responsemap := v.(map[string]interface{})
 	code := responsemap["code"].(string)
 	if code == APC_Success {//执行成功
 		if responsemap["status"].(string)=="valid"{
@@ -397,63 +542,50 @@ func parserResponseErr(responsemap map[string]interface{}) error {
 }
 
 //获取淘宝账户的授权令牌
-func (client *AliPayClient)GetApp_Auth_Token(userinfo *TaoBoUserInfo)([]byte,error)  {
+func (client *AliPayClient)GetApp_Auth_Token(userinfo *TaoBoUserInfo)(map[string]interface{},error)  {
 	method := getMethod("alipay.open.auth.token.app",client.fAppId,client.getSignType())
 	defer freeMethod(method)
 	method.FillNormalargs()
 	method.appendArg("biz_content",fmt.Sprintf(`{"grant_type":"authorization_code","code":"%s"}`,userinfo.Auth_code))
-	body,err := method.Call(client)
+	responsemap,err := method.CallEx(client,"alipay_open_auth_token_app_response")
 	if err == nil{
 		//执行成功，返回数据
-		ok := false
-		var v interface{}
-		result := make(map[string]interface{})
-		err = json.Unmarshal(body,&result)
-		if err != nil{
-			return nil,err
-		}
-		if v,ok = result["alipay_open_auth_token_app_response"];!ok{
-			return nil,InvalidResponseErr
-		}else{
-			responsemap := v.(map[string]interface{})
-			code := responsemap["code"].(string)
-			if code == APC_Success{//执行成功
-				userinfo.Auth_token = responsemap["app_auth_token"].(string)
-				userinfo.Refresh_token = responsemap["app_refresh_token"].(string)
-				vin := responsemap["expires_in"]
-				switch vin.(type) {
-				case uint:
-					userinfo.Expires_in = vin.(uint)
-					userinfo.Re_Expires_in = responsemap["re_expires_in"].(uint)
-				case int:
-					userinfo.Expires_in = uint(vin.(int))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(int))
-				case uint32:
-					userinfo.Expires_in = uint(vin.(uint32))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(uint32))
-				case int32:
-					userinfo.Expires_in = uint(vin.(int32))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(int32))
-				case int64:
-					userinfo.Expires_in = uint(vin.(int64))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(int64))
-				case uint64:
-					userinfo.Expires_in = uint(vin.(uint64))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(uint64))
-				case float32:
-					userinfo.Expires_in = uint(vin.(float32))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(float32))
-				case float64:
-					userinfo.Expires_in = uint(vin.(float64))
-					userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(float64))
-				}
-				userinfo.UserID = responsemap["user_id"].(string)
-				userinfo.Sign = result["sign"].(string)
-			}else{//执行失败了
-				return nil,parserResponseErr(responsemap)
+		code := responsemap["code"].(string)
+		if code == APC_Success{//执行成功
+			userinfo.Auth_token = responsemap["app_auth_token"].(string)
+			userinfo.Refresh_token = responsemap["app_refresh_token"].(string)
+			vin := responsemap["expires_in"]
+			switch vin.(type) {
+			case uint:
+				userinfo.Expires_in = vin.(uint)
+				userinfo.Re_Expires_in = responsemap["re_expires_in"].(uint)
+			case int:
+				userinfo.Expires_in = uint(vin.(int))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(int))
+			case uint32:
+				userinfo.Expires_in = uint(vin.(uint32))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(uint32))
+			case int32:
+				userinfo.Expires_in = uint(vin.(int32))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(int32))
+			case int64:
+				userinfo.Expires_in = uint(vin.(int64))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(int64))
+			case uint64:
+				userinfo.Expires_in = uint(vin.(uint64))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(uint64))
+			case float32:
+				userinfo.Expires_in = uint(vin.(float32))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(float32))
+			case float64:
+				userinfo.Expires_in = uint(vin.(float64))
+				userinfo.Re_Expires_in = uint(responsemap["re_expires_in"].(float64))
 			}
+			userinfo.UserID = responsemap["user_id"].(string)
+		}else{//执行失败了
+			return responsemap,parserResponseErr(responsemap)
 		}
-		return body,nil
+		return responsemap,nil
 	}
 	return nil,err
 }
@@ -464,9 +596,11 @@ func (client *AliPayClient)GetApp_Auth_Token(userinfo *TaoBoUserInfo)([]byte,err
 func (client *AliPayClient)TradeCreate(seller *TaoBoUserInfo,trade *TradeInfo,IsPreviewCreate bool)(string,error)  {
 	trade.Auth_code = ""
 	trade.Scene = ""
+	responseKey := "alipay_trade_precreate_response"
 	method := getMethod("alipay.trade.precreate",client.fAppId,client.getSignType())
 	if !IsPreviewCreate{
 		method.Name = "alipay.trade.create"//非预下单
+		responseKey = "alipay_trade_create_response"
 	}
 	if seller!=nil{
 		trade.Seller_Uid = seller.UserID //指定为商户ID
@@ -482,23 +616,11 @@ func (client *AliPayClient)TradeCreate(seller *TaoBoUserInfo,trade *TradeInfo,Is
 	if client.NotifyGateWayurl != ""{
 		method.appendArg("notify_url",client.NotifyGateWayurl)
 	}
-
  	method.appendArg("biz_content",trade.biz_content(client.ClientUid))
-	body,err := method.Call(client)
-	if err !=nil{
+	responsemap,err := method.CallEx(client,responseKey)
+	if err!=nil{
 		return "",err
 	}
-	//执行成功，会返回一个二维码
-	var(
-		v interface{}
-		ok bool
-	)
-	result := make(map[string]interface{})
-	err = json.Unmarshal(body,&result)
-	if v,ok = result["alipay_trade_precreate_response"];!ok{
-		return "",InvalidResponseErr
-	}
-	responsemap := v.(map[string]interface{})
 	code := responsemap["code"].(string)
 	if code == APC_Success {//执行成功
 		return responsemap["qr_code"].(string),nil
@@ -537,21 +659,14 @@ func (client *AliPayClient)TradeCancel(seller *TaoBoUserInfo,out_trade_no,trade_
 		}
 		return result
 	}())
-	body,err := method.Call(client)
-	if err == InvalidResponseErr || err == InvalidPrivateKeyErr ||
-		err == ParsePrivateKeyErr || err == SignPKCS1v15Err{
-		return nil,err
-	}
 	var(
 		v interface{}
 		ok bool
 	)
-	result := make(map[string]interface{})
-	err = json.Unmarshal(body,&result)
-	if v,ok = result["alipay_trade_cancel_response"];!ok{
-		return nil,InvalidResponseErr
+	responsemap,err := method.CallEx(client,"alipay_trade_cancel_response")
+	if err != nil{
+		return nil,err
 	}
-	responsemap := v.(map[string]interface{})
 	code := responsemap["code"].(string)
 	if code == APC_Success{ //执行返回成功
 		tradeRes := new(TradeResponse)
@@ -603,21 +718,10 @@ func (client *AliPayClient)TradeQuery(seller *TaoBoUserInfo,out_trade_no,trade_n
 		}
 		return result
 	}())
-	body,err := method.Call(client)
-	if err == InvalidResponseErr || err == InvalidPrivateKeyErr ||
-		err == ParsePrivateKeyErr || err == SignPKCS1v15Err{
+	responsemap,err := method.CallEx(client,"alipay_trade_query_response")
+	if err != nil{
 		return nil,err
 	}
-	result := make(map[string]interface{})
-	err = json.Unmarshal(body,&result)
-	var(
-		v interface{}
-		ok bool
-	)
-	if v,ok = result["alipay_trade_query_response"];!ok{
-		return nil,InvalidResponseErr
-	}
-	responsemap := v.(map[string]interface{})
 	code := responsemap["code"].(string)
 	if code == APC_Success {
 		//执行返回成功
@@ -653,20 +757,70 @@ func (client *AliPayClient)TradePay(seller *TaoBoUserInfo,trade *TradeInfo)(map[
 		method.appendArg("notify_url",client.NotifyGateWayurl)
 	}
 	method.appendArg("biz_content",trade.biz_content(client.ClientUid))
-	body,err := method.Call(client)
-	if err !=nil{
+	if responsemap,err := method.CallEx(client,"alipay_trade_precreate_response");err!=nil{
+		return nil,err
+	}else{
+		code := responsemap["code"].(string)
+		if code == APC_Success {//执行成功
+			return responsemap,nil
+		}else{
+			return nil,parserResponseErr(responsemap)
+		}
+	}
+}
+
+//alipay.trade.refund (统一收单交易退款接口)
+func (client *AliPayClient)TradeRefund(Auth_token string,RefundInfo *TradeRefundInfo)(map[string]interface{},error)  {
+	if RefundInfo.Out_trade_no == "" && RefundInfo.Trade_no == ""{
+		return nil,errors.New("out_trade_no和trade_no不能同时为空")
+	}
+	method := getMethod("alipay.trade.refund",client.fAppId,client.getSignType())
+	defer freeMethod(method)
+	method.FillNormalargs()
+	if Auth_token!=""{
+		method.appendArg("app_auth_token",Auth_token) //指定授权令牌
+	}
+	method.appendArg("biz_content",func()string{
+		result := "{"
+		if RefundInfo.Out_trade_no != ""{
+			result = fmt.Sprintf(`%s"out_trade_no":"%s"`,result,RefundInfo.Out_trade_no)
+		}
+		if RefundInfo.Trade_no != ""{
+			if result == "{"{
+				result = fmt.Sprintf(`%s,"trade_no":"%s"`,result,RefundInfo.Trade_no)
+			}else{
+				result = fmt.Sprintf(`%s"trade_no":"%s"`,result,RefundInfo.Trade_no)
+			}
+		}
+		//退款金额
+		result = fmt.Sprintf(`%s,"refund_amount":%.2f`,result,RefundInfo.Refund_amount)
+		//退款原因
+		if RefundInfo.Refund_reason != ""{
+			result = fmt.Sprintf(`%s,"refund_reason":"%s"`,result,RefundInfo.Refund_reason)
+		}
+		//退款单号，如果一笔单据需要多次退款，必填，需要保持唯一
+		if RefundInfo.Out_request_no != ""{
+			result = fmt.Sprintf(`%s,"out_request_no":"%s"`,result,RefundInfo.Out_request_no)
+		}
+
+		if RefundInfo.Operator_id != ""{
+			result = fmt.Sprintf(`%s,"operator_id":"%s"`,result,RefundInfo.Operator_id)
+		}
+
+		if RefundInfo.Store_id != ""{
+			result = fmt.Sprintf(`%s,"store_id":"%s"`,result,RefundInfo.Store_id)
+		}
+
+		if RefundInfo.Terminal_id != ""{
+			result = fmt.Sprintf(`%s,"terminal_id":"%s"`,result,RefundInfo.Terminal_id)
+		}
+		result=fmt.Sprintf("%s}",result)
+		return result
+	}())
+	responsemap,err := method.CallEx(client,"alipay_trade_refund_response")
+	if err != nil{
 		return nil,err
 	}
-	var(
-		v interface{}
-		ok bool
-	)
-	result := make(map[string]interface{})
-	err = json.Unmarshal(body,&result)
-	if v,ok = result["alipay_trade_precreate_response"];!ok{
-		return nil,InvalidResponseErr
-	}
-	responsemap := v.(map[string]interface{})
 	code := responsemap["code"].(string)
 	if code == APC_Success {//执行成功
 		return responsemap,nil
@@ -675,10 +829,52 @@ func (client *AliPayClient)TradePay(seller *TaoBoUserInfo,trade *TradeInfo)(map[
 	}
 }
 
-func NewAlipayCilient(appId string,privatekey string)*AliPayClient  {
+//异步验证签名，回调通知的内容进行验证
+//args表示传递过来的参数
+func (client *AliPayClient)NotifyCheckSign(args *fasthttp.Args)error  {
+	arglist := make([]argValue,0,30)
+	signtype := ""
+	sign := ""
+	args.VisitAll(func(k,v []byte){
+		switch string(k) {
+		case "sign_type": signtype = string(v)
+		case "sign": sign = string(v)
+		default:
+			arglist = append(arglist,argValue{string(k),string(v)})
+		}
+	})
+	//已经排序完成的
+	if sign == ""{
+		return errors.New("未发现sign签名字段")
+	}
+	thisSigntype := client.SignType
+	if signtype!=""{
+		if signtype == "RSA2"{
+			thisSigntype = RSA2
+		}else{
+			thisSigntype = RSA
+		}
+	}
+	sort.Slice(arglist,func(i, j int) bool{
+		return arglist[i].Name < arglist[j].Name
+	})
+	result := ""
+	for i:=0;i<len(arglist);i++{
+		if i == 0{
+			result = fmt.Sprintf("%s=%s",arglist[i].Name,arglist[i].Value)
+		}else{
+			result = fmt.Sprintf("%s&%s=%s",result,arglist[i].Name,arglist[i].Value)
+		}
+	}
+	return client.CheckSign(result,sign,thisSigntype)
+}
+
+func NewAlipayCilient(appId string,privatekey,publickey string)*AliPayClient  {
 	result := new(AliPayClient)
 	result.SignType = RSA2 //默认采用RSA2算法
 	result.fAppId = appId
 	result.fPrivateKey = privatekey
+	result.fPublickey = publickey
+	result.VerifySign = true //默认开启验证返回的结果参数验证签名
 	return result
 }
