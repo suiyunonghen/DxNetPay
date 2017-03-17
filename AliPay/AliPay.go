@@ -402,6 +402,7 @@ func (tradeinfo *TradeInfo)biz_content(sys_service_provider_id string)string  {
 		buffer.WriteString(tradeinfo.Seller_Uid)
 	}
 	//扫描枪扫手机支付码的时候，会有这个scene和auth_code两个参数
+
 	if tradeinfo.Scene != ""{
 		buffer.WriteString(`","scene":"`)
 		buffer.WriteString(tradeinfo.Scene)
@@ -413,7 +414,7 @@ func (tradeinfo *TradeInfo)biz_content(sys_service_provider_id string)string  {
 
 	buffer.WriteString(`","total_amount":`)
 	buffer.WriteString(fmt.Sprintf("%.2f",tradeinfo.Total_amount))
-
+	fhasyh := false //没有引号
 	if tradeinfo.Discountable_amount !=0 {
 		buffer.WriteString(`,"discountable_amount":`)
 		buffer.WriteString(fmt.Sprintf("%.2f",tradeinfo.Discountable_amount))
@@ -425,37 +426,77 @@ func (tradeinfo *TradeInfo)biz_content(sys_service_provider_id string)string  {
 	if tradeinfo.Buyer_logon_id != ""{
 		buffer.WriteString(`,"buyer_logon_id":"`)
 		buffer.WriteString(tradeinfo.Buyer_logon_id)
+		fhasyh = true
 	}
 	if tradeinfo.Subject != ""{
-		buffer.WriteString(`","subject":"`)
+		if fhasyh{
+			buffer.WriteString(`","subject":"`)
+		}else{
+			buffer.WriteString(`,"subject":"`)
+		}
 		buffer.WriteString(tradeinfo.Subject)
+		fhasyh = true
 	}
 	if tradeinfo.Body != ""{
-		buffer.WriteString(`","body":"`)
+		if fhasyh{
+			buffer.WriteString(`","body":"`)
+		}else{
+			buffer.WriteString(`,"body":"`)
+		}
 		buffer.WriteString(tradeinfo.Body)
+		fhasyh = true
 	}
 	if tradeinfo.Operator_id !=""{
-		buffer.WriteString(`","operator_id":"`)
+		if fhasyh{
+			buffer.WriteString(`","operator_id":"`)
+		}else{
+			buffer.WriteString(`,"operator_id":"`)
+		}
 		buffer.WriteString(tradeinfo.Operator_id)
+		fhasyh = true
 	}
 	if tradeinfo.Store_id != ""{
-		buffer.WriteString(`","store_id":"`)
+		if fhasyh {
+			buffer.WriteString(`","store_id":"`)
+		}else{
+			buffer.WriteString(`,"store_id":"`)
+		}
 		buffer.WriteString(tradeinfo.Store_id)
+		fhasyh = true
 	}
 	if tradeinfo.Terminal_id !=""{
-		buffer.WriteString(`","terminal_id":"`)
+		if fhasyh {
+			buffer.WriteString(`","terminal_id":"`)
+		}else{
+			buffer.WriteString(`,"terminal_id":"`)
+		}
 		buffer.WriteString(tradeinfo.Terminal_id)
+		fhasyh = true
 	}
 	if tradeinfo.Alipay_store_id !=""{
-		buffer.WriteString(`","alipay_store_id":"`)
+		if fhasyh {
+			buffer.WriteString(`","alipay_store_id":"`)
+		}else{
+			buffer.WriteString(`,"alipay_store_id":"`)
+		}
 		buffer.WriteString(tradeinfo.Alipay_store_id)
+		fhasyh = true
 	}
 	if sys_service_provider_id !=""{
-		buffer.WriteString(`","extend_params":"{\"sys_service_provider_id\":\"`)
+		if fhasyh {
+			buffer.WriteString(`","extend_params":"{\"sys_service_provider_id\":\"`)
+		}else{
+			buffer.WriteString(`,"extend_params":"{\"sys_service_provider_id\":\"`)
+		}
 		buffer.WriteString(sys_service_provider_id)
 		buffer.WriteString(`\"}`)
+		fhasyh = true
 	}
-	buffer.WriteString(`","timeout_express":"90m"`)
+	if fhasyh{
+		buffer.WriteString(`","timeout_express":"90m"`)
+	}else{
+		buffer.WriteString(`,"timeout_express":"90m"`)
+	}
 	if tradeinfo.Goods_detail !=nil && len(tradeinfo.Goods_detail)!=0{
 		buffer.WriteString(`,"goods_detail":[`)
 		for idx,v := range tradeinfo.Goods_detail {
@@ -631,7 +672,12 @@ func (method *AlipayMethod)CallEx(client *AliPayClient,responsekey string)(map[s
 	if client.VerifySign{ //执行返回验证签名
 		str,signstr := getResponsestr(body,[]byte(responsekey))
 		if str =="" || signstr==""{
-			return nil,errors.New("获取验证签名数据失败！")
+			result := make(map[string]interface{})
+			err = json.Unmarshal(body,&result)
+			if err != nil{
+				return nil,err
+			}
+			return nil,parserResponseErr(result[responsekey].(map[string]interface{}))
 		}
 		//开始执行验证签名
 		if err = client.CheckSign(str,signstr,client.SignType);err!=nil{
@@ -1171,6 +1217,14 @@ func (client *AliPayClient)NotifyCheckSign(args *fasthttp.Args)error  {
 		}
 	}
 	return client.CheckSign(result,sign,thisSigntype)
+}
+
+func (client *AliPayClient) ResetClient(appid string,privatekey,publickey string){
+	client.fAppId = appid
+	client.fPrivateKey = privatekey
+	client.fPublickey = publickey
+	client.privateKey = nil
+	client.publicKey = nil
 }
 
 func NewAlipayCilient(appId string,privatekey,publickey string)*AliPayClient  {
