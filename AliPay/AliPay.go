@@ -1,5 +1,6 @@
 //支付宝的SDK接口
 //作者：不得闲
+//QQ:75492895
 package AliPay
 
 import (
@@ -20,10 +21,20 @@ import (
 	"bytes"
 	"strings"
 	"hash"
+	"os"
+	"unsafe"
+	"path/filepath"
+	"sync/atomic"
+	"os/exec"
 )
 
-type SignType byte
-type ResponseStatus byte
+type (
+	SignType byte
+	ResponseStatus byte
+	NotifyStyle   byte	 //通知样式
+	TradeStatus	byte	//订单状态
+	FundChannel	byte	//支付渠道
+)
 //签名样式sign_type
 const(
 	RSA SignType=iota
@@ -36,6 +47,95 @@ const(
 	RS_Invalid     //返回无效状态
 	RS_Request_Retry  //请求需要重试
 )
+
+//通知类型
+const(
+	NS_UnKnown	NotifyStyle=iota
+	NS_TradePreCreate	//预下订单通知
+	NS_TradeCreate				//下单
+	NS_TradePay				//扫码支付通知
+)
+
+//订单状态
+const(
+	TS_UnKnown		TradeStatus=iota
+	TS_WAIT_BUYER_PAY				//交易创建，等待买家付款
+	TS_TRADE_CLOSED					//未付款交易超时关闭，或支付完成后全额退款
+	TS_TRADE_SUCCESS				//交易支付成功
+	TS_TRADE_FINISHED				//交易结束，不可退款
+)
+
+func TradeStatus2Name(status TradeStatus)string  {
+	switch status {
+	case TS_WAIT_BUYER_PAY:	return "WAIT_BUYER_PAY"
+	case TS_TRADE_CLOSED: return "TRADE_CLOSED"
+	case TS_TRADE_SUCCESS: return "TRADE_SUCCESS"
+	case TS_TRADE_FINISHED: return "TRADE_FINISHED"
+	}
+	return ""
+}
+
+func Name2TradeStatus(Name string)TradeStatus  {
+	switch Name {
+	case "WAIT_BUYER_PAY":	return TS_WAIT_BUYER_PAY
+	case "TRADE_CLOSED": return TS_TRADE_CLOSED
+	case "TRADE_SUCCESS": return TS_TRADE_SUCCESS
+	case "TRADE_FINISHED": return TS_TRADE_FINISHED
+	}
+	return TS_UnKnown
+}
+
+//支付渠道
+const(
+	FC_UnKnown FundChannel=iota			//未知
+	FC_COUPON  					//支付宝红包
+	FC_ALIPAYACCOUNT				//支付宝余额
+	FC_POINT					//集分宝
+	FC_DISCOUNT					//折扣券
+	FC_PCARD					//预付卡
+	FC_FINANCEACCOUNT				//余额宝
+	FC_MCARD					//商家储值卡
+	FC_MDISCOUNT					//商户优惠券
+	FC_MCOUPON					//商户红包
+	FC_PCREDIT					//蚂蚁花呗
+)
+
+func FundChannelName(channel FundChannel)string  {
+	switch channel {
+	case FC_COUPON: return "COUPON"
+	case FC_ALIPAYACCOUNT: return "ALIPAYACCOUNT"
+	case FC_POINT:	return 	"POINT"
+	case FC_DISCOUNT: return "DISCOUNT"
+	case FC_PCARD:	return "PCARD"
+	case FC_FINANCEACCOUNT: return "FINANCEACCOUNT"
+	case FC_MCARD: return "MCARD"
+	case FC_MDISCOUNT: return "MDISCOUNT"
+	case FC_MCOUPON: return "MCOUPON"
+	case FC_PCREDIT: return "PCREDIT"
+	}
+	return ""
+}
+
+func FastByte2String(bt []byte)string  {
+	return *(*string)(unsafe.Pointer(&bt))
+}
+
+func Name2FundChannel(Name string)FundChannel  {
+	switch Name {
+	case "COUPON": return FC_COUPON
+	case "ALIPAYACCOUNT": return FC_ALIPAYACCOUNT
+	case "POINT":	return 	FC_POINT
+	case "DISCOUNT": return FC_DISCOUNT
+	case "PCARD":	return FC_PCARD
+	case "FINANCEACCOUNT": return FC_FINANCEACCOUNT
+	case "MCARD": return FC_MCARD
+	case "MDISCOUNT": return FC_MDISCOUNT
+	case "MCOUPON": return FC_MCOUPON
+	case "PCREDIT": return FC_PCREDIT
+	}
+	return FC_UnKnown  //默认使用支付宝余额
+}
+
 type AliPayClient struct {
 	fAppId	string
 	fPrivateKey string    //用户私钥
@@ -44,7 +144,8 @@ type AliPayClient struct {
 	publicKey  *rsa.PublicKey
 	SignType   SignType  //签名算法类型
 	Alipayurl string      //阿里巴巴的API网关
-	NotifyGateWayurl  string	//应用网关，回调通知
+	AppGateWayurl  string	//应用网关，回调通知
+	NotifyUrl	string		//通知回调
 	ClientUid	  string 	//主要用来设置支付中的系统商的PID,sys_service_provider_id
 	VerifySign	bool		//是否验证签名
 }
@@ -65,10 +166,20 @@ type TaoBoUserInfo struct {
 	Refresh_token   string   //刷新令牌
 	Expires_in      uint      //令牌有效时间长度
 	Re_Expires_in   uint      //刷新令牌有效时间长度
+	userData	interface{}  //用户数据
+}
+
+func (user *TaoBoUserInfo)SetUserData(v interface{})  {
+	user.userData = v
+}
+
+func (user *TaoBoUserInfo)GetUserData()interface{}  {
+	return user.userData
 }
 
 //商品信息
-type GoodInfo struct {
+type (
+	GoodInfo struct {
 	Goods_id		string	`json:"goods_id"`
 	Alipay_goods_id		string	`json:"alipay_goods_id"`
 	Goods_name		string	`json:"goods_name"`
@@ -77,37 +188,169 @@ type GoodInfo struct {
 	Goods_category		string	`json:"goods_category"`
 	Body			string	`json:"body"`
 	Show_url		string	`json:"show_url"`
-}
+	}
 
-//退款信息结构体
-type TradeRefundInfo struct {
-	Out_trade_no		string 	`json:"out_trade_no"`	//商户系统产生的订单编号
-	Trade_no		string 	`json:"trade_no"`	//支付宝交易号
-	Refund_amount		float32	`json:"refund_amount"`  //退款金额
-	Refund_reason		string 	`json:"refund_reason"` //退款原因
-	Out_request_no		string 	`json:"out_request_no"` //商户的退款单编号，如果一个订单要多次退款，必填
-	Operator_id		string 	`json:"operator_id"` //商户操作员ID
-	Store_id		string 	`json:"store_id"` //商户门店ID
-	Terminal_id		string 	`json:"terminal_id"` //商户终端机器ID
-}
+
+	//退款信息结构体
+	 TradeRefundInfo struct {
+		Out_trade_no		string 	`json:"out_trade_no"`	//商户系统产生的订单编号
+		Trade_no		string 	`json:"trade_no"`	//支付宝交易号
+		Refund_amount		float32	`json:"refund_amount"`  //退款金额
+		Refund_reason		string 	`json:"refund_reason"` //退款原因
+		Out_request_no		string 	`json:"out_request_no"` //商户的退款单编号，如果一个订单要多次退款，必填
+		Operator_id		string 	`json:"operator_id"` //商户操作员ID
+		Store_id		string 	`json:"store_id"` //商户门店ID
+		Terminal_id		string 	`json:"terminal_id"` //商户终端机器ID
+	}
+
+	BufferLoggerWriter struct {
+		fhasfilehandle	int32
+		logfiletag	string			//文件标记名称
+		logDataSize	int			//记录的文件大小
+		rwlock		sync.RWMutex
+		buffer   	bytes.Buffer
+		quitchan	chan struct{}
+		datachan	chan []byte
+	}
+)
 
 func (good *GoodInfo)JsonString()string  {
-	result := fmt.Sprintf(`{"goods_id":"%s"`,good.Goods_id)
+	var buffer bytes.Buffer
+	buffer.WriteString(`{"goods_id":"`)
+	buffer.WriteString(good.Goods_id)
 	if good.Alipay_goods_id != ""{
-		result = fmt.Sprintf(`%s,"alipay_goods_id":"%s"`,result,good.Alipay_goods_id)
+		buffer.WriteString(`","alipay_goods_id":"`)
+		buffer.WriteString(good.Alipay_goods_id)
 	}
-	result = fmt.Sprintf(`%s,"goods_name":"%s","quantity":%.2f,"price":%.2f`, result,good.Goods_name,good.Quantity,good.Price)
+	buffer.WriteString(`","goods_name":"`)
+	buffer.WriteString(good.Goods_name)
+	buffer.WriteString(`","quantity":`)
+	buffer.WriteString(fmt.Sprintf("%.2f",good.Quantity))
+	buffer.WriteString(`,"price":`)
+	buffer.WriteString(fmt.Sprintf("%.2f",good.Price))
+
 	if good.Goods_category != ""{
-		result = fmt.Sprintf(`%s,"goods_category":"%s"`,result,good.Goods_category)
+		buffer.WriteString(`,"goods_category":"`)
+		buffer.WriteString(good.Goods_category)
 	}
 	if good.Body != ""{
-		result = fmt.Sprintf(`%s,"body":"%s"`,result,good.Body)
+		buffer.WriteString(`","body":"`)
+		buffer.WriteString(good.Body)
 	}
 	if good.Show_url != ""{
-		result = fmt.Sprintf(`%s,"show_url":"%s"`,result,good.Show_url)
+		buffer.WriteString(`","show_url":"`)
+		buffer.WriteString(good.Show_url)
 	}
-	result = fmt.Sprintf(`%s}`,result)
-	return result
+	buffer.WriteString(`"}`)
+	return FastByte2String(buffer.Bytes()) //buffer.String()
+}
+
+func (loggerWriter *BufferLoggerWriter)Write(p []byte) (n int, err error)  {
+	//写入缓存区
+	if loggerWriter.buffer.Cap() == 0{
+		loggerWriter.buffer.Grow(102400) //分配100K缓冲区
+	}
+	//通知有数据到来
+	if atomic.LoadInt32(&loggerWriter.fhasfilehandle)==1{
+		loggerWriter.datachan <- p //通知数据到来
+	}
+	return len(p),nil
+}
+
+func (loggerWriter *BufferLoggerWriter)QuitWriter(){
+	loggerWriter.quitchan<- struct{}{}
+}
+
+func NewLoggerBufferWriter() *BufferLoggerWriter {
+	bufferWriter := new(BufferLoggerWriter)
+	bufferWriter.quitchan = make(chan struct{})
+	bufferWriter.datachan = make(chan []byte,20)
+	return bufferWriter
+}
+
+func (loggerWriter *BufferLoggerWriter)WriteData2File()  {
+	curExeDir,_ := exec.LookPath(os.Args[0])
+	logdir := filepath.Dir(curExeDir)
+	logdir = fmt.Sprintf("%s%s",logdir,"\\log\\")
+	//判断目录是否存在
+	if _,err := os.Stat(logdir);err != nil{
+		os.MkdirAll(logdir,0777)
+	}
+	curExeDir = fmt.Sprintf("%s%s%s.log",logdir,loggerWriter.logfiletag,time.Now().Format("2006-01-02_15_04_05"))
+	if finfo,err := os.Stat(curExeDir);err == nil && !finfo.IsDir(){
+		if finfo.Size() > 40*1024*1024{ //文件很大了，直接新建文件
+			curExeDir = fmt.Sprintf("%s%s%s%s.log",logdir,"\\log\\",loggerWriter.logfiletag,time.Now().Add(time.Second).Format("2006-01-02_15_04_05"))
+		}
+	}
+	if file,err := os.OpenFile(curExeDir, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666);err==nil{
+		atomic.StoreInt32(&loggerWriter.fhasfilehandle,1)
+		file.Seek(0,os.SEEK_END) //移动到末尾
+		for{
+			select{
+			case bt,ok:=<-loggerWriter.datachan:
+				//有数据过来，写入文件
+				if ok{
+					var wbt []byte
+					loggerWriter.rwlock.Lock()
+					loggerWriter.buffer.Write(bt)
+					if loggerWriter.buffer.Len() >= 100000{
+						wbt = loggerWriter.buffer.Bytes()
+						loggerWriter.buffer.Reset()
+					}
+					loggerWriter.rwlock.Unlock()
+					if wbt != nil{//写入文件
+						if wlen,err := file.Write(wbt);err==nil{
+							loggerWriter.logDataSize += wlen
+							if loggerWriter.logDataSize >= 60*1024*1024{ //60M
+								file.Close() //超过60M，创建新文件
+								loggerWriter.logDataSize = 0
+								curExeDir = fmt.Sprintf("%s%s%s%s.log",logdir,"\\log\\",
+									loggerWriter.logfiletag,time.Now().Add(time.Second).Format("2006-01-02_15_04_05"))
+								if file,err = os.OpenFile(curExeDir, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666);
+									err!=nil{
+									return
+								}
+							}
+						}
+					}
+				}
+			case <-loggerWriter.quitchan:
+				loggerWriter.rwlock.RLock()
+				wbt := loggerWriter.buffer.Bytes()
+				loggerWriter.rwlock.RUnlock()
+				if len(wbt)>0{//写入文件
+					if wlen,err := file.Write(wbt);err==nil{
+						loggerWriter.logDataSize += wlen
+					}
+				}
+				file.Close()
+				return
+			default:
+				time.Sleep(time.Second*2) //默认等待2秒
+				loggerWriter.rwlock.Lock()
+				wbt := loggerWriter.buffer.Bytes()
+				if len(wbt) > 0{
+					loggerWriter.buffer.Reset()//重置
+				}
+				loggerWriter.rwlock.Unlock()
+				if len(wbt)>0{//写入文件
+					if wlen,err := file.Write(wbt);err==nil{
+						loggerWriter.logDataSize += wlen
+						if loggerWriter.logDataSize >= 60*1024*1024{ //60M
+							file.Close() //超过60M，创建新文件
+							loggerWriter.logDataSize = 0
+							curExeDir = fmt.Sprintf("%s%s%s%s.log",logdir,"\\log\\",
+								loggerWriter.logfiletag,time.Now().Add(time.Second).Format("2006-01-02_15_04_05"))
+							if file,err = os.OpenFile(curExeDir, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666);
+								err!=nil{
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 //订单信息
@@ -129,67 +372,104 @@ type TradeInfo struct {
 	Scene		string		`json:"scene"`    //支付场景 条码支付，取值：bar_code 声波支付，取值：wave_code
 }
 
+func (trade *TradeInfo)ReSet()  {
+	trade.Trade_No = ""
+	trade.Seller_Uid = ""
+	trade.Total_amount = 0
+	trade.Discountable_amount=0
+	trade.Undiscountable_amount=0
+	trade.Buyer_logon_id = ""
+	trade.Subject = ""
+	trade.Body = ""
+	trade.Operator_id = ""
+	trade.Store_id = ""
+	trade.Terminal_id = ""
+	trade.Alipay_store_id = ""
+	trade.Auth_code = ""
+	trade.Scene = ""
+	if trade.Goods_detail != nil{
+		trade.Goods_detail = trade.Goods_detail[0:0]
+	}
+}
 
 //根据订单信息生成支付参数biz_content
 func (tradeinfo *TradeInfo)biz_content(sys_service_provider_id string)string  {
-	result := fmt.Sprintf(`{"out_trade_no":"%s"`,tradeinfo.Trade_No)
+	var buffer bytes.Buffer
+	buffer.WriteString(`{"out_trade_no":"`)
+	buffer.WriteString(tradeinfo.Trade_No)
 	if tradeinfo.Seller_Uid != ""{
-		result = fmt.Sprintf(`%s,"seller_id":"%s"`,result,tradeinfo.Seller_Uid)
+		buffer.WriteString(`","seller_id":"`)
+		buffer.WriteString(tradeinfo.Seller_Uid)
 	}
 	//扫描枪扫手机支付码的时候，会有这个scene和auth_code两个参数
 	if tradeinfo.Scene != ""{
-		result = fmt.Sprintf(`%s,"scene":"%s"`,result,tradeinfo.Scene)
+		buffer.WriteString(`","scene":"`)
+		buffer.WriteString(tradeinfo.Scene)
 	}
 	if tradeinfo.Auth_code != ""{
-		result = fmt.Sprintf(`%s,"auth_code":"%s"`,result,tradeinfo.Auth_code)
+		buffer.WriteString(`","auth_code":"`)
+		buffer.WriteString(tradeinfo.Auth_code)
 	}
 
-	result = fmt.Sprintf(`%s,"total_amount":%.2f`,result,tradeinfo.Total_amount)
+	buffer.WriteString(`","total_amount":`)
+	buffer.WriteString(fmt.Sprintf("%.2f",tradeinfo.Total_amount))
+
 	if tradeinfo.Discountable_amount !=0 {
-		result = fmt.Sprintf(`%s,"discountable_amount":%.2f`,result,tradeinfo.Discountable_amount)
+		buffer.WriteString(`,"discountable_amount":`)
+		buffer.WriteString(fmt.Sprintf("%.2f",tradeinfo.Discountable_amount))
 	}
 	if tradeinfo.Undiscountable_amount !=0 {
-		result = fmt.Sprintf(`%s,"undiscountable_amount":%.2f`,result,tradeinfo.Undiscountable_amount)
+		buffer.WriteString(`,"undiscountable_amount":`)
+		buffer.WriteString(fmt.Sprintf("%.2f",tradeinfo.Undiscountable_amount))
 	}
 	if tradeinfo.Buyer_logon_id != ""{
-		result = fmt.Sprintf(`%s,"buyer_logon_id":"%s"`,result,tradeinfo.Buyer_logon_id)
+		buffer.WriteString(`,"buyer_logon_id":"`)
+		buffer.WriteString(tradeinfo.Buyer_logon_id)
 	}
 	if tradeinfo.Subject != ""{
-		result = fmt.Sprintf(`%s,"subject":"%s"`,result,tradeinfo.Subject)
+		buffer.WriteString(`","subject":"`)
+		buffer.WriteString(tradeinfo.Subject)
 	}
 	if tradeinfo.Body != ""{
-		result = fmt.Sprintf(`%s,"body":"%s"`,result,tradeinfo.Body)
+		buffer.WriteString(`","body":"`)
+		buffer.WriteString(tradeinfo.Body)
 	}
 	if tradeinfo.Operator_id !=""{
-		result = fmt.Sprintf(`%s,"operator_id":"%s"`,result,tradeinfo.Operator_id)
+		buffer.WriteString(`","operator_id":"`)
+		buffer.WriteString(tradeinfo.Operator_id)
 	}
 	if tradeinfo.Store_id != ""{
-		result = fmt.Sprintf(`%s,"store_id":"%s"`,result,tradeinfo.Store_id)
+		buffer.WriteString(`","store_id":"`)
+		buffer.WriteString(tradeinfo.Store_id)
 	}
 	if tradeinfo.Terminal_id !=""{
-		result = fmt.Sprintf(`%s,"terminal_id":"%s"`,result,tradeinfo.Terminal_id)
+		buffer.WriteString(`","terminal_id":"`)
+		buffer.WriteString(tradeinfo.Terminal_id)
 	}
 	if tradeinfo.Alipay_store_id !=""{
-		result = fmt.Sprintf(`%s,"alipay_store_id":"%s"`,result,tradeinfo.Alipay_store_id)
+		buffer.WriteString(`","alipay_store_id":"`)
+		buffer.WriteString(tradeinfo.Alipay_store_id)
 	}
 	if sys_service_provider_id !=""{
-		exprams := fmt.Sprintf(`{"sys_service_provider_id":"%s"}`,sys_service_provider_id)
-		result = fmt.Sprintf(`%s,"extend_params":"%s"`,result,exprams)
+		buffer.WriteString(`","extend_params":"{\"sys_service_provider_id\":\"`)
+		buffer.WriteString(sys_service_provider_id)
+		buffer.WriteString(`\"}`)
 	}
-	result = fmt.Sprintf(`%s,"timeout_express":"90m"`,result)
+	buffer.WriteString(`","timeout_express":"90m"`)
 	if tradeinfo.Goods_detail !=nil && len(tradeinfo.Goods_detail)!=0{
-		goodsDetail := ""
-		for _,v := range tradeinfo.Goods_detail {
-			if goodsDetail == ""{
-				goodsDetail = v.JsonString()
+		buffer.WriteString(`,"goods_detail":[`)
+		for idx,v := range tradeinfo.Goods_detail {
+			if idx == 0{
+				buffer.WriteString(v.JsonString())
 			}else{
-				goodsDetail = fmt.Sprintf("%s,%s",goodsDetail,v.JsonString())
+				buffer.WriteString(",")
+				buffer.WriteString(v.JsonString())
 			}
 		}
-		result = fmt.Sprintf(`%s,"goods_detail":[%s]`,result,goodsDetail)
+		buffer.WriteString("]")
 	}
-	result = fmt.Sprintf(`%s}`,result)
-	return result
+	buffer.WriteString("}")
+	return FastByte2String(buffer.Bytes())
 }
 
 type argValue struct {
@@ -299,7 +579,7 @@ func getResponsestr(respbody,resps []byte)(respstr,signstr string)  {
 		}else if v == '}'{
 			if startcount--;startcount==0{
 				//完结
-				respstr = string(body[startidx:index+1])
+				respstr = FastByte2String(body[startidx:index+1])
 				body = body[index+1:]
 				break
 			}
@@ -318,7 +598,7 @@ func getResponsestr(respbody,resps []byte)(respstr,signstr string)  {
 					hasStart = true
 					startidx = index+1//开始了
 				}else{//结束
-					signstr = string(body[startidx:index])
+					signstr = FastByte2String(body[startidx:index])
 					break
 				}
 			}
@@ -348,7 +628,6 @@ func (method *AlipayMethod)CallEx(client *AliPayClient,responsekey string)(map[s
 		responsekey = fmt.Sprintf("%s_response",strings.Replace(method.Name,".","_",-1))
 	}
 	body := resp.Body()
-	//fmt.Println(string(body))
 	if client.VerifySign{ //执行返回验证签名
 		str,signstr := getResponsestr(body,[]byte(responsekey))
 		if str =="" || signstr==""{
@@ -453,7 +732,7 @@ func (client *AliPayClient)RsaSign(origData string) (string, error) {
 		return "", SignPKCS1v15Err
 	}
 	data := base64.StdEncoding.EncodeToString(s)
-	return string(data), nil
+	return data, nil
 }
 
 func (client *AliPayClient)getSignType()string  {
@@ -597,12 +876,17 @@ func (client *AliPayClient)TradeCreate(seller *TaoBoUserInfo,trade *TradeInfo,Is
 	trade.Auth_code = ""
 	trade.Scene = ""
 	responseKey := "alipay_trade_precreate_response"
+	methodName := "TradePreCreate"
 	method := getMethod("alipay.trade.precreate",client.fAppId,client.getSignType())
 	if !IsPreviewCreate{
 		method.Name = "alipay.trade.create"//非预下单
 		responseKey = "alipay_trade_create_response"
+		methodName = "TradeCreate"
 	}
 	if seller!=nil{
+		if seller.UserID == ""{
+			return "",errors.New("请指定有效的商户ID")
+		}
 		trade.Seller_Uid = seller.UserID //指定为商户ID
 	}else{
 		trade.Seller_Uid = ""
@@ -612,9 +896,9 @@ func (client *AliPayClient)TradeCreate(seller *TaoBoUserInfo,trade *TradeInfo,Is
 	if seller!=nil{
 		method.appendArg("app_auth_token",seller.Auth_token) //指定授权令牌
 	}
-	//指定回调应用网关
-	if client.NotifyGateWayurl != ""{
-		method.appendArg("notify_url",client.NotifyGateWayurl)
+	//指定回调应用网关，为指定网址+方法
+	if client.NotifyUrl != ""{
+		method.appendArg("notify_url",fmt.Sprintf(`%s/%s`,client.NotifyUrl,methodName))
 	}
  	method.appendArg("biz_content",trade.biz_content(client.ClientUid))
 	responsemap,err := method.CallEx(client,responseKey)
@@ -626,6 +910,26 @@ func (client *AliPayClient)TradeCreate(seller *TaoBoUserInfo,trade *TradeInfo,Is
 		return responsemap["qr_code"].(string),nil
 	}else{
 		return "",parserResponseErr(responsemap)
+	}
+}
+
+//获得通知回调时候的调用方法
+func GetNotifyMethod(nstyle NotifyStyle)string  {
+	switch nstyle {
+	case NS_TradeCreate: return "TradeCreate"
+	case NS_TradePreCreate: return 	"TradePreCreate"
+	case NS_TradePay:	return 	"TradePay"
+	}
+	return ""
+}
+
+func NotifyMethodName2Style(name string)NotifyStyle{
+	switch name {
+	case "TradeCreate": return NS_TradeCreate
+	case "TradePreCreate": return NS_TradePreCreate
+	case "TradePay":	return NS_TradePay
+	default:
+			return NS_UnKnown
 	}
 }
 
@@ -753,8 +1057,8 @@ func (client *AliPayClient)TradePay(seller *TaoBoUserInfo,trade *TradeInfo)(map[
 		method.appendArg("app_auth_token",seller.Auth_token) //指定授权令牌
 	}
 	//指定回调应用网关
-	if client.NotifyGateWayurl != ""{
-		method.appendArg("notify_url",client.NotifyGateWayurl)
+	if client.NotifyUrl != ""{
+		method.appendArg("notify_url",fmt.Sprintf(`%s/%s`,client.NotifyUrl,GetNotifyMethod(NS_TradePay)))
 	}
 	method.appendArg("biz_content",trade.biz_content(client.ClientUid))
 	if responsemap,err := method.CallEx(client,"alipay_trade_precreate_response");err!=nil{
@@ -836,11 +1140,11 @@ func (client *AliPayClient)NotifyCheckSign(args *fasthttp.Args)error  {
 	signtype := ""
 	sign := ""
 	args.VisitAll(func(k,v []byte){
-		switch string(k) {
-		case "sign_type": signtype = string(v)
-		case "sign": sign = string(v)
+		switch FastByte2String(k) {
+		case "sign_type": signtype = FastByte2String(v)
+		case "sign": sign = FastByte2String(v)
 		default:
-			arglist = append(arglist,argValue{string(k),string(v)})
+			arglist = append(arglist,argValue{FastByte2String(k),FastByte2String(v)})
 		}
 	})
 	//已经排序完成的
